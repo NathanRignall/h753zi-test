@@ -1,0 +1,4 @@
+# The firmware crate one level up sets `build.target` to the Cortex-M triple and
+# cargo inherits parent configs, so point this crate back at the host.
+[build]
+target = "aarch64-apple-darwin"

@@ -1,0 +1,12 @@
+[target.thumbv7em-none-eabihf]
+# `probe-rs chip list | grep H753` if you use a different package.
+runner = "probe-rs run --chip STM32H753ZITx"
+rustflags = [
+    "-C", "linker=flip-link",
+]
+
+[build]
+target = "thumbv7em-none-eabihf" # Cortex-M7F with double-precision FPU
+
+[env]
+DEFMT_LOG = "info"

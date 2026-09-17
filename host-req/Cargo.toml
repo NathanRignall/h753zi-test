@@ -1,0 +1,9 @@
+[package]
+name = "host-req"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+nng-core = { path = "../../nng-core" }
+tokio = { version = "1", features = ["full"] }

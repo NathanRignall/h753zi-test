@@ -1,0 +1,77 @@
+[package]
+name = "h753zi-net-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# The board is normally wired straight to a host, so a fixed address is the
+# default. Build with `--no-default-features` to use DHCP instead.
+default = ["static-ip"]
+# Use the fixed address configured in the `static_ip` module of `src/main.rs`.
+static-ip = []
+
+[dependencies]
+embassy-stm32 = { version = "0.6.0", features = [
+    "defmt",
+    "stm32h753zi",
+    "time-driver-tim2",
+    "exti",
+    "unstable-pac",
+] }
+embassy-executor = { version = "0.10.0", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "defmt",
+] }
+embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+embassy-sync = { version = "0.8.0", features = ["defmt"] }
+embassy-net = { version = "0.9.1", features = [
+    "defmt",
+    "tcp",
+    "udp",
+    "dhcpv4",
+    "dns",
+    "medium-ethernet",
+    "proto-ipv4",
+    # smoltcp gates ICMP echo replies behind this; without it the board is
+    # reachable but silently unpingable.
+    "auto-icmp-echo-reply",
+] }
+embassy-futures = "0.1.2"
+
+# The thing under test: pure-Rust NNG over the embassy-net TCP stack.
+# `embassy` pulls in the embassy-net/embassy-time adapters used by `sock`.
+nng-core = { path = "../nng-core", default-features = false, features = ["embassy"] }
+embedded-alloc = "0.6"
+
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+critical-section = "1.2"
+embedded-io-async = "0.7"
+static_cell = "2"
+heapless = { version = "0.9", default-features = false }
+rand_core = "0.9"
+
+defmt = "1.0"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+libm = "0.2"
+uom = { version = "0.38", default-features = false, features = ["f32", "f64", "si", "autoconvert"] }
+
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+opt-level = 1
+overflow-checks = true
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = 3
+overflow-checks = false
