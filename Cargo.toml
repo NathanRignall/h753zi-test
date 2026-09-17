@@ -44,6 +44,7 @@ embassy-futures = "0.1.2"
 # `embassy` pulls in the embassy-net/embassy-time adapters used by `sock`.
 nng-core = { path = "../nng-core", default-features = false, features = ["embassy"] }
 embedded-alloc = "0.6"
+telemetry-wire = { path = "telemetry-wire" }
 
 cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
 cortex-m-rt = "0.7.5"

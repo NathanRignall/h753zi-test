@@ -1,0 +1,19 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Host-side tools for the H753ZI telemetry board"
+
+[[bin]]
+name = "req"
+path = "src/bin/req.rs"
+
+[[bin]]
+name = "sub"
+path = "src/bin/sub.rs"
+
+[dependencies]
+nng-core = { path = "../../nng-core" }
+telemetry-wire = { path = "../telemetry-wire" }
+tokio = { version = "1", features = ["full"] }

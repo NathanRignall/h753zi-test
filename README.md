@@ -25,7 +25,8 @@ Dev dependencies come from a Nix flake; flashing and logging go through
 | inbound | ICMP echo (smoltcp answers it) | `ping <addr>` |
 | inbound | TCP echo server on `:1234` (2 concurrent clients) | `nc <addr> 1234` |
 | inbound | UDP echo server on `:1234` | `nc -u <addr> 1234` |
-| inbound | **`nng-core` REP0 socket on `:5555`** | `host-req` (below) |
+| inbound | **`nng-core` REP0 telemetry on `:5555`** | `cargo run --bin req` |
+| outbound | **`nng-core` PUB0 telemetry stream on `:5556`** | `cargo run --bin sub` |
 | outbound | TCP connect to the host on `:1234` + a greeting | `nc -l 1234` on the host |
 | outbound (DHCP build) | DNS lookup of `example.com`, then TCP + `HEAD /` | RTT log at startup |
 | board | LD1 (green) blinks at 1 Hz — executor is alive | look at the board |
@@ -163,54 +164,91 @@ nc 192.168.50.11 1234
 Anything you type comes straight back, and each read is logged on the RTT
 side. `nc -u 192.168.50.11 1234` does the same over UDP.
 
-## nng-core over embassy-net
+## Telemetry over nng-core
 
-The board runs a real [`nng-core`](../nng-core) REP0 socket on `:5555`, served
-straight off the same `embassy-net` stack — `nng_core::sock::Socket` with
-`EmbassyTcpListener` + `serve_listener`, two listener tasks (one TCP socket
-each, so two concurrent NNG pipes) feeding two worker tasks through the
-socket's contexts. Each request comes back as `pong from h753zi: <body>`.
+The board's sensor readings leave over NNG, on the same `embassy-net` stack,
+in both of the shapes you'd actually want:
 
-`host-req/` is the other end: an ordinary std/tokio `nng-core` REQ client.
+| Socket | Port | Model |
+|---|---|---|
+| REP0 | 5555 | poll — any request is answered with one frame, sampled at reply time |
+| PUB0 | 5556 | stream — the same frame published at 5 Hz to every subscriber |
+
+Both live in [src/nng_net.rs](src/nng_net.rs) and read from the same
+`telemetry::snapshot()` the console summary uses, so the wire and the RTT log
+can never disagree.
+
+### The frame
+
+[telemetry-wire/](telemetry-wire/) is a tiny `no_std`, dependency-free crate
+holding the one definition of the format, shared by the firmware and the host
+tools: a fixed 69-byte little-endian record carrying uptime, position, fix
+quality, satellites, altitude, speed, course, yaw/pitch/roll, IMU calibration
+status and acceleration, plus flags for what is valid and what has gone stale.
+
+It starts with the magic `H7TM`, which doubles as the SUB topic — a subscriber
+filtering on `telemetry_wire::MAGIC` gets every telemetry frame and nothing
+else, so the filter cannot drift from the format.
 
 ```bash
-cd host-req && cargo run --release
+cd telemetry-wire && cargo test
 ```
+
+### Host tools
+
+[host/](host/) is an ordinary std/tokio `nng-core` peer with two binaries.
+
+Poll it:
 
 ```bash
-cd host-req && cargo run --release -- tcp://192.168.50.11:5555 ping 20
+cd host && cargo run --release --bin req -- tcp://192.168.50.11:5555 5 300
 ```
-
-Arguments are `[addr] [payload] [count]`; with a count above 1 each request is
-suffixed `#0`, `#1`, … Measured on this setup: **~0.65 ms** per round trip, and
-two clients can run at once.
 
 ```
 dialing tcp://192.168.50.11:5555
- 0.73 ms  pong from h753zi: ping #0
- 0.70 ms  pong from h753zi: ping #1
- 0.61 ms  pong from h753zi: ping #2
+   20.423s pos 52.179875,0.147999 alt 16.5m (fix 1, 12 sats) | yaw -49.1 pitch 0.1 roll 21.8 (imu 0/3)  [0.64 ms]
+   20.728s pos 52.179875,0.147999 alt 16.5m (fix 1, 12 sats) | yaw -49.1 pitch 0.1 roll 21.8 (imu 0/3)  [1.48 ms]
 ```
 
-Board side:
+Arguments are `[addr] [count] [interval_ms]`.
+
+Stream it:
+
+```bash
+cd host && cargo run --release --bin sub
+```
 
 ```
-2.011016 [INFO ] [nng] REP0 listening on :5555
-2.011016 [INFO ] [nng] REP0 listening on :5555
-83.714630 [INFO ] [nng 1] request: ping #0
-83.715301 [INFO ] [nng 1] request: ping #1
+subscribing to tcp://192.168.50.11:5556
+   29.412s pos 52.179872,0.147999 alt 16.5m (fix 1, 12 sats) | yaw -49.1 pitch 0.1 roll 21.9 (imu 0/3)
+   29.612s pos 52.179872,0.147999 alt 16.5m (fix 1, 12 sats) | yaw -49.1 pitch 0.1 roll 21.8 (imu 0/3)  (+200 ms)
+
+15 frames in 2.9s (5.2 Hz)
 ```
 
-Notes:
+Arguments are `[addr] [count]`; without a count it runs until interrupted. The
+`(+N ms)` column is the gap between board timestamps, so a dropped frame is
+visible as a doubled interval.
+
+Measured on this setup: REQ/REP round trips land at **~0.7 ms**, and two
+subscribers plus a poller run at once without either stream slipping.
+
+### Notes
 
 * `nng-core` is a path dependency with `default-features = false, features =
   ["embassy"]` — no `std`, no tokio.
 * `nng_core::Message` is `Vec<u8>`-backed, so `main.rs` installs an
   `embedded-alloc` heap (32 KB) before anything touches a `Message`.
-* On Embassy the NNG pipe count is fixed at the number of listener tasks you
-  spawn, so `SocketConfig::max_pipes` must match `NNG_PIPES`. A third
-  simultaneous client is accepted at TCP level and then closed at the SP level.
-* `host-req/.cargo/config.toml` points `build.target` back at the host triple,
+* On Embassy the NNG pipe count is fixed at the number of listener tasks
+  spawned, so each socket's `SocketConfig::max_pipes` matches its pipe
+  constant in `nng_net.rs` (2 REP peers, 2 subscribers). A third simultaneous
+  peer is accepted at TCP level and then closed at the SP level.
+* Every socket here consumes a slot in `StackResources`. Overrunning it panics
+  inside smoltcp with *"adding a socket to a full SocketSet"* — that is the
+  symptom to recognise when adding another listener.
+* PUB drops rather than blocks when a subscriber is slow, so a stalled
+  consumer can never back-pressure the sensor tasks.
+* `host/.cargo/config.toml` points `build.target` back at the host triple,
   because cargo would otherwise inherit the Cortex-M target from this crate's
   config. Change it if you are not on Apple silicon.
 
@@ -256,8 +294,12 @@ test becomes a DNS lookup of `example.com` followed by an HTTP `HEAD`.
 | `.cargo/config.toml` | default target, `probe-rs` runner, `flip-link`, `DEFMT_LOG` |
 | `memory.x` | STM32H753ZI flash/RAM map (2 MB flash, 512 KB AXI SRAM) |
 | `build.rs` | installs `memory.x` and passes the `link.x`/`defmt.x` linker args |
-| `src/main.rs` | the test itself |
-| `host-req/` | std/tokio `nng-core` REQ client for the board's REP socket |
+| `src/main.rs` | startup, network bring-up, echo servers |
+| `src/gnss.rs`, `src/imu.rs` | sensor drivers |
+| `src/telemetry.rs` | shared sensor store + the console summary |
+| `src/nng_net.rs` | the NNG REP + PUB telemetry sockets |
+| `telemetry-wire/` | the frame format, shared by firmware and host |
+| `host/` | std/tokio `nng-core` peer: `req` (poll) and `sub` (stream) |
 
 Versions: `embassy-stm32` 0.6.0, `embassy-net` 0.9.1, `embassy-executor`
 0.10.0, `embassy-time` 0.5.1, `nng-core` 0.3.0 (path), Rust 1.92,

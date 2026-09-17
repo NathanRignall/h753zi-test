@@ -1,0 +1,8 @@
+[package]
+name = "telemetry-wire"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Wire format shared by the H753ZI firmware and the host tools"
+
+[dependencies]

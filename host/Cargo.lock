@@ -52,10 +52,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "host-req"
+name = "host"
 version = "0.1.0"
 dependencies = [
  "nng-core",
+ "telemetry-wire",
  "tokio",
 ]
 
@@ -193,6 +194,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "telemetry-wire"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"

@@ -1,3 +1,4 @@
 /target
 /.direnv
-/host-req/target
+/host/target
+/telemetry-wire/target

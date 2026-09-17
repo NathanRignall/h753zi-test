@@ -5,7 +5,7 @@
 //! stack from both directions:
 //!
 //! * inbound  — ICMP echo, TCP echo on :1234, UDP echo on :1234, and an
-//!   `nng-core` REP0 socket on :5555
+//!   `nng-core` telemetry sockets (REP0 :5555, PUB0 :5556)
 //! * outbound — one connection at startup: back to the peer on :1234 for a
 //!   point-to-point link, or a DNS lookup plus HTTP `HEAD` on a DHCP network
 //!
@@ -37,10 +37,6 @@ use embassy_stm32::{Config, bind_interrupts, dma, eth, peripherals, rng, uid};
 use embassy_time::{Duration, Timer, with_timeout};
 use embedded_alloc::LlffHeap as Heap;
 use embedded_io_async::Write;
-use nng_core::Message;
-use nng_core::sock::driver::serve_listener;
-use nng_core::sock::embassy::{EmbassyClock, EmbassyTcpListener};
-use nng_core::sock::{Socket, SocketConfig, proto};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -52,6 +48,7 @@ static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 mod gnss;
 mod imu;
+mod nng_net;
 mod telemetry;
 
 /// I2C1, shared by the GNSS and IMU tasks. Everything runs on one executor,
@@ -60,13 +57,6 @@ pub type Bus = Mutex<NoopRawMutex, I2c<'static, Async, Master>>;
 
 /// Port used by both the TCP and the UDP echo server.
 const ECHO_PORT: u16 = 1234;
-/// Port the `nng-core` REP0 socket listens on.
-const NNG_PORT: u16 = 5555;
-/// Concurrent NNG peers. On Embassy the pipe count is the number of listener
-/// tasks, so `SocketConfig::max_pipes` has to match this.
-const NNG_PIPES: usize = 2;
-/// Request handlers sharing the REP socket.
-const NNG_WORKERS: usize = 2;
 /// Host the outbound self-test resolves and connects to (DHCP builds only).
 #[cfg(not(feature = "static-ip"))]
 const PROBE_HOST: &str = "example.com";
@@ -198,7 +188,10 @@ async fn main(spawner: Spawner) -> ! {
         })
     };
 
-    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+    // 2 TCP echo + 1 UDP echo + 1 outbound probe + nng_net's REP and PUB
+    // listeners + the stack's own DHCP/DNS sockets. Overrunning this panics
+    // inside smoltcp with "adding a socket to a full SocketSet".
+    static RESOURCES: StaticCell<StackResources<16>> = StaticCell::new();
     let (stack, runner) = embassy_net::new(device, net_config, RESOURCES.init(StackResources::new()), seed);
 
     spawner.spawn(unwrap!(net_task(runner)));
@@ -225,26 +218,17 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(unwrap!(tcp_echo_task(stack, 1)));
     spawner.spawn(unwrap!(udp_echo_task(stack)));
 
-    // nng-core REP0 over the same stack: `NNG_PIPES` listeners, each owning one
-    // TcpSocket, feeding `NNG_WORKERS` handlers through the socket's contexts.
-    static NNG_REP: StaticCell<Socket<proto::Rep0>> = StaticCell::new();
-    let nng_rep: &'static Socket<proto::Rep0> = NNG_REP.init(Socket::new(SocketConfig {
-        max_pipes: NNG_PIPES,
-        ..SocketConfig::default()
-    }));
-    for _ in 0..NNG_PIPES {
-        spawner.spawn(unwrap!(nng_listener_task(nng_rep, stack)));
-    }
-    for id in 0..NNG_WORKERS as u8 {
-        spawner.spawn(unwrap!(nng_worker_task(nng_rep, id)));
-    }
+    // nng-core sockets carrying telemetry over the same stack.
+    nng_net::spawn(&spawner, stack);
 
     // One-shot outbound test: DNS, then a TCP connect + HTTP HEAD.
     outbound_probe(stack).await;
 
     info!(
-        "ready — try `ping <addr>`, `nc <addr> {}`, `nc -u <addr> {}`, nng req to :{}",
-        ECHO_PORT, ECHO_PORT, NNG_PORT
+        "ready — echo on :{}, nng telemetry: REP :{}, PUB :{}",
+        ECHO_PORT,
+        nng_net::REP_PORT,
+        nng_net::PUB_PORT
     );
 
     // Keep the main task alive; everything else runs in spawned tasks.
@@ -354,51 +338,6 @@ async fn udp_echo_task(stack: Stack<'static>) -> ! {
                 }
             }
             Err(e) => warn!("[udp] recv error: {:?}", e),
-        }
-    }
-}
-
-/// One NNG pipe: accept a peer, run the SP handshake, pump it into the shared
-/// REP socket, then go back to accepting.
-#[embassy_executor::task(pool_size = NNG_PIPES)]
-async fn nng_listener_task(sock: &'static Socket<proto::Rep0>, stack: Stack<'static>) {
-    let mut rx_buffer = [0u8; 2048];
-    let mut tx_buffer = [0u8; 2048];
-    let tcp = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    let mut listener = EmbassyTcpListener::new(tcp, NNG_PORT);
-
-    info!("[nng] REP0 listening on :{}", NNG_PORT);
-    serve_listener(sock, &mut listener, &EmbassyClock).await;
-    warn!("[nng] listener returned — socket closed");
-}
-
-/// Answers requests arriving on any pipe of the REP socket.
-#[embassy_executor::task(pool_size = NNG_WORKERS)]
-async fn nng_worker_task(sock: &'static Socket<proto::Rep0>, id: u8) {
-    let mut ctx = unwrap!(sock.context().ok(), "no free NNG context");
-
-    loop {
-        let (req, responder) = match ctx.receive_request().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("[nng {}] receive error: {:?}", id, defmt::Debug2Format(&e));
-                Timer::after(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-
-        info!(
-            "[nng {}] request: {}",
-            id,
-            core::str::from_utf8(req.body()).unwrap_or("<non-utf8>")
-        );
-
-        let mut reply = Message::new();
-        reply.push_back(b"pong from h753zi: ");
-        reply.push_back(req.body());
-
-        if let Err(e) = responder.reply(reply).await {
-            warn!("[nng {}] reply error: {:?}", id, defmt::Debug2Format(&e));
         }
     }
 }
